@@ -1,0 +1,223 @@
+#include <pcl/io/pcd_io.h>
+#include <pcl/point_types.h>
+#include <pcl/visualization/pcl_visualizer.h>
+#include <pcl/common/common.h>
+#include <pcl/common/centroid.h>
+#include <pcl/segmentation/sac_segmentation.h>
+#include <pcl/filters/extract_indices.h>
+#include <pcl/kdtree/kdtree.h>
+#include <pcl/segmentation/extract_clusters.h>
+#include <pcl/surface/concave_hull.h>
+#include <Eigen/Dense>
+#include <Eigen/SVD>
+#include <iostream>
+#include <vector>
+#include <algorithm>
+#include <cmath> // for std::sqrt
+
+void computePlaneCoefficients(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+    pcl::ModelCoefficients& plane_coefficients) {
+    Eigen::Vector4f centroid;
+    pcl::compute3DCentroid(*cloud, centroid);
+    Eigen::Matrix3f covariance_matrix;
+    pcl::computeCovarianceMatrix(*cloud, centroid, covariance_matrix);
+    Eigen::JacobiSVD<Eigen::Matrix3f> svd(covariance_matrix, Eigen::ComputeFullU);
+    Eigen::Matrix3f U = svd.matrixU();
+    Eigen::Vector3f normal = U.col(2);
+    Eigen::Vector3f point_on_plane = centroid.head<3>();
+    plane_coefficients.values.resize(4);
+    plane_coefficients.values[0] = normal[0];
+    plane_coefficients.values[1] = normal[1];
+    plane_coefficients.values[2] = normal[2];
+    plane_coefficients.values[3] = -normal.dot(point_on_plane);
+}
+
+float pointToPlaneDistance(const pcl::PointXYZ& point, const pcl::ModelCoefficients& plane) {
+    float a = plane.values[0];
+    float b = plane.values[1];
+    float c = plane.values[2];
+    float d = plane.values[3];
+    return std::abs(a * point.x + b * point.y + c * point.z + d) / std::sqrt(a * a + b * b + c * c);
+}
+
+pcl::PointXYZ projectPointToPlane(const pcl::PointXYZ& point, const pcl::ModelCoefficients& plane) {
+    Eigen::Vector4f plane_coefficients(plane.values[0], plane.values[1], plane.values[2], plane.values[3]);
+    Eigen::Vector4f point_eigen(point.x, point.y, point.z, 1.0);
+    Eigen::Vector4f projected_point_eigen;
+    Eigen::Vector4f normal(plane_coefficients[0], plane_coefficients[1], plane_coefficients[2], 0.0);
+    float d = plane_coefficients[3];
+    float t = -(normal.dot(point_eigen) + d) / normal.head<3>().squaredNorm();
+    projected_point_eigen = point_eigen + t * normal;
+    return pcl::PointXYZ(projected_point_eigen[0], projected_point_eigen[1], projected_point_eigen[2]);
+}
+
+void computePCA(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud, float& length, float& max_width) {
+    Eigen::MatrixXf data(cloud->points.size(), 3);
+    for (size_t i = 0; i < cloud->points.size(); ++i) {
+        data(i, 0) = cloud->points[i].x;
+        data(i, 1) = cloud->points[i].y;
+        data(i, 2) = cloud->points[i].z;
+    }
+
+    Eigen::Vector4f centroid;
+    pcl::compute3DCentroid(*cloud, centroid);
+    Eigen::Matrix3f covariance_matrix;
+    pcl::computeCovarianceMatrix(*cloud, centroid, covariance_matrix);
+
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> eig(covariance_matrix);
+    Eigen::Matrix3f eigenvectors = eig.eigenvectors();
+    Eigen::Vector3f eigenvalues = eig.eigenvalues();
+
+    Eigen::Vector3f axis1 = eigenvectors.col(2);
+    Eigen::Vector3f axis2 = eigenvectors.col(1);
+
+    length = eigenvalues[2];
+    max_width = 0.0f;
+    for (float t = -length / 2; t <= length / 2; t += 0.003f) {//主轴方向测宽度0.3cm间隔
+        Eigen::Vector3f point_on_axis1 = centroid.head<3>() + t * axis1;
+        float min_dist = std::numeric_limits<float>::max();
+        float max_dist = -std::numeric_limits<float>::max();
+        for (const auto& point : cloud->points) {
+            Eigen::Vector3f point_eigen(point.x, point.y, point.z);
+            float dist = (point_eigen - point_on_axis1).dot(axis2);
+            min_dist = std::min(min_dist, dist);
+            max_dist = std::max(max_dist, dist);
+        }
+        float width = max_dist - min_dist;
+        if (width > max_width) {
+            max_width = width;
+        }
+    }
+}
+
+int main(int argc, char** argv) {
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud1(new pcl::PointCloud<pcl::PointXYZ>);
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud2(new pcl::PointCloud<pcl::PointXYZ>);
+
+    if (pcl::io::loadPCDFile<pcl::PointXYZ>("resource1.pcd", *cloud1) == -1) {
+        PCL_ERROR("Couldn't read file resource1.pcd \n");
+        return (-1);
+    }
+
+    if (pcl::io::loadPCDFile<pcl::PointXYZ>("resource2.1.pcd", *cloud2) == -1) {
+        PCL_ERROR("Couldn't read file resource2.1.pcd \n");
+        return (-1);
+    }
+
+    pcl::ModelCoefficients plane_coefficients;
+    computePlaneCoefficients(cloud1, plane_coefficients);
+
+    pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+    tree->setInputCloud(cloud2);
+
+    std::vector<pcl::PointIndices> cluster_indices;
+    pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
+    ec.setClusterTolerance(0.003); // 0.3 cm聚类
+    ec.setMinClusterSize(30);
+    ec.setMaxClusterSize(25000);
+    ec.setSearchMethod(tree);
+    ec.setInputCloud(cloud2);
+    ec.extract(cluster_indices);
+
+    std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> clusters;
+    for (const auto& indices : cluster_indices) {
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cluster(new pcl::PointCloud<pcl::PointXYZ>);
+        for (const auto& idx : indices.indices)
+            cluster->points.push_back(cloud2->points[idx]);
+        cluster->width = cluster->points.size();
+        cluster->height = 1;
+        cluster->is_dense = true;
+        clusters.push_back(cluster);
+    }
+
+    std::sort(clusters.begin(), clusters.end(),
+        [](const pcl::PointCloud<pcl::PointXYZ>::Ptr& a, const pcl::PointCloud<pcl::PointXYZ>::Ptr& b) {
+            return a->size() > b->size();
+        });
+
+    // Create a vector to store the boundary points with their cluster numbers
+    std::vector<std::pair<int, pcl::PointXYZ>> boundary_points_with_numbers;
+
+    for (size_t i = 0; i < clusters.size(); ++i) {
+        float max_distance = 0.0f;
+        for (const auto& point : clusters[i]->points) {
+            float distance = pointToPlaneDistance(point, plane_coefficients);
+            if (distance > max_distance)
+                max_distance = distance;
+        }
+        std::cout << "No. " << i + 1 << " has " << clusters[i]->size()
+            << " points, max distance to plane: " << max_distance << " m" << std::endl;
+
+        // Store boundary points with their cluster numbers
+        for (const auto& point : clusters[i]->points) {
+            boundary_points_with_numbers.emplace_back(i + 1, point);
+        }
+    }
+
+    pcl::PointCloud<pcl::PointXYZ>::Ptr projected_cloud1(new pcl::PointCloud<pcl::PointXYZ>);
+    std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> projected_clusters;
+
+    for (const auto& point : cloud1->points) {
+        projected_cloud1->points.push_back(projectPointToPlane(point, plane_coefficients));
+    }
+
+    for (const auto& cluster : clusters) {
+        pcl::PointCloud<pcl::PointXYZ>::Ptr projected_cluster(new pcl::PointCloud<pcl::PointXYZ>);
+        for (const auto& point : cluster->points) {
+            projected_cluster->points.push_back(projectPointToPlane(point, plane_coefficients));
+        }
+        projected_clusters.push_back(projected_cluster);
+    }
+
+    // Alpha-Shape 检测
+    pcl::PointCloud<pcl::PointXYZ>::Ptr alpha_shape(new pcl::PointCloud<pcl::PointXYZ>);
+    pcl::ConcaveHull<pcl::PointXYZ> concave_hull;
+    concave_hull.setInputCloud(projected_cloud1);
+    concave_hull.setAlpha(0.0011); // alpha值设置为0.11cm
+    std::vector<pcl::PointIndices> hull_indices;
+    concave_hull.reconstruct(*alpha_shape);
+
+    // Create visualizer and add the projected point clouds
+    pcl::visualization::PCLVisualizer viewer("PCL Visualizer");
+    viewer.setBackgroundColor(0, 0, 0);
+
+    // Add projected cloud1 (plane) with white color
+    pcl::visualization::PointCloudColorHandlerCustom<pcl::PointXYZ> projected_cloud1_color_handler(projected_cloud1, 255, 255, 255); // White
+    viewer.addPointCloud<pcl::PointXYZ>(projected_cloud1, projected_cloud1_color_handler, "projected_cloud1");
+
+    // Add clusters with sequential colors: red, green, blue
+    std::vector<std::vector<uint8_t>> colors = { {255, 0, 0}, {0, 255, 0}, {0, 0, 255} }; // Red, Green, Blue
+    int cluster_id = 0;
+    for (const auto& cluster : projected_clusters) {
+        pcl::visualization::PointCloudColorHandlerCustom<pcl::PointXYZ> cluster_color_handler(cluster, colors[cluster_id % colors.size()][0], colors[cluster_id % colors.size()][1], colors[cluster_id % colors.size()][2]);
+        std::string cluster_name = "cluster_" + std::to_string(cluster_id);
+        viewer.addPointCloud<pcl::PointXYZ>(cluster, cluster_color_handler, cluster_name);
+
+        // Add 3D text label for each cluster
+        pcl::PointXYZ centroid;
+        pcl::computeCentroid(*cluster, centroid);
+        viewer.addText3D("Cluster " + std::to_string(cluster_id + 1), centroid, 0.01, 1.0, 1.0, 1.0, "label_" + std::to_string(cluster_id));
+
+        ++cluster_id;
+    }
+
+    // Add alpha-shape with orange color
+    pcl::visualization::PointCloudColorHandlerCustom<pcl::PointXYZ> alpha_shape_color_handler(alpha_shape, 255, 165, 0); // Orange
+    viewer.addPointCloud<pcl::PointXYZ>(alpha_shape, alpha_shape_color_handler, "alpha_shape");
+
+    viewer.initCameraParameters();
+
+    // Compute and print PCA results for each cluster
+    for (size_t i = 0; i < clusters.size(); ++i) {
+        float length, max_width;
+        computePCA(clusters[i], length, max_width);
+        std::cout << "Cluster " << i + 1 << " length: " << length
+            << " m, max width: " << max_width << " m" << std::endl;
+    }
+
+    while (!viewer.wasStopped()) {
+        viewer.spinOnce(100);
+    }
+
+    return 0;
+}
