@@ -102,7 +102,7 @@ main(int argc, char** argv)
 
 The first step is to run a file called "plane segment" to generate planes and cracks.
 
-<img src="utils/media/teaser.png" alt="Network" style="zoom:50%;">
+
 
 The second step is to run the "plane analysis" file on the premise that the file name corresponds.
 
