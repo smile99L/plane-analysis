@@ -1,0 +1,239 @@
+#include <pcl/io/pcd_io.h>
+#include <pcl/point_types.h>
+#include <pcl/features/normal_3d.h>
+#include <pcl/features/boundary.h>
+#include <pcl/segmentation/region_growing.h>
+#include <pcl/segmentation/sac_segmentation.h>
+#include <pcl/filters/extract_indices.h>
+#include <pcl/kdtree/kdtree_flann.h>
+#include <pcl/visualization/pcl_visualizer.h>
+#include <Eigen/Core>
+
+class PlaneSegmenter {
+public:
+    PlaneSegmenter() : k_search_(50), smooth_threshold_(3.0),
+        curvature_threshold_(0.5), min_cluster_size_(850),
+        boundary_angle_threshold_(M_PI / 4), distance_threshold_(0.025) {}
+
+    void segment(pcl::PointCloud<pcl::PointXYZ>::Ptr cloud,
+        pcl::PointCloud<pcl::PointXYZ>::Ptr plane_cloud,
+        pcl::PointCloud<pcl::PointXYZ>::Ptr crack_cloud) {
+
+        // 1. 法线估计
+        pcl::PointCloud<pcl::Normal>::Ptr normals = computeNormals(cloud);
+
+        // 2. 区域生长算法进行平面粗提取
+        std::vector<pcl::PointIndices> clusters = regionGrowingSegmentation(cloud, normals);
+
+        // 3. 提取粗平面点云
+        pcl::PointIndices::Ptr initial_planes = extractInitialPlanes(clusters);
+
+        // 4. 提取边界点
+        pcl::PointCloud<pcl::Boundary>::Ptr boundaries = computeBoundaries(cloud, normals);
+        pcl::PointIndices::Ptr boundary_indices = extractBoundaryPoints(boundaries);
+
+        // 5. 优化平面分割
+        pcl::PointIndices::Ptr final_planes = optimizeSegmentation(
+            cloud, initial_planes, boundary_indices);
+
+        // 6. 分离平面和裂缝点云
+        separatePlanesAndCracks(cloud, final_planes, plane_cloud, crack_cloud);
+    }
+
+    void setDistanceThreshold(float threshold) { distance_threshold_ = threshold; }
+
+private:
+    pcl::PointCloud<pcl::Normal>::Ptr computeNormals(pcl::PointCloud<pcl::PointXYZ>::Ptr cloud) {
+        pcl::NormalEstimation<pcl::PointXYZ, pcl::Normal> ne;
+        pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>());
+        pcl::PointCloud<pcl::Normal>::Ptr normals(new pcl::PointCloud<pcl::Normal>);
+
+        ne.setInputCloud(cloud);
+        ne.setSearchMethod(tree);
+        ne.setKSearch(k_search_);
+        ne.compute(*normals);
+
+        return normals;
+    }
+
+    std::vector<pcl::PointIndices> regionGrowingSegmentation(
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud,
+        pcl::PointCloud<pcl::Normal>::Ptr normals) {
+
+        pcl::RegionGrowing<pcl::PointXYZ, pcl::Normal> reg;
+        pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+
+        reg.setMinClusterSize(min_cluster_size_);
+        reg.setMaxClusterSize(10000000);
+        reg.setSearchMethod(tree);
+        reg.setNumberOfNeighbours(30);
+        reg.setInputCloud(cloud);
+        reg.setInputNormals(normals);
+        reg.setSmoothnessThreshold(smooth_threshold_ / 180.0 * M_PI);
+        reg.setCurvatureThreshold(curvature_threshold_);
+
+        std::vector<pcl::PointIndices> clusters;
+        reg.extract(clusters);
+
+        return clusters;
+    }
+
+    pcl::PointIndices::Ptr extractInitialPlanes(const std::vector<pcl::PointIndices>& clusters) {
+        pcl::PointIndices::Ptr initial_planes(new pcl::PointIndices);
+        for (const auto& cluster : clusters) {
+            initial_planes->indices.insert(initial_planes->indices.end(),
+                cluster.indices.begin(), cluster.indices.end());
+        }
+        return initial_planes;
+    }
+
+    pcl::PointCloud<pcl::Boundary>::Ptr computeBoundaries(
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud,
+        pcl::PointCloud<pcl::Normal>::Ptr normals) {
+
+        pcl::BoundaryEstimation<pcl::PointXYZ, pcl::Normal, pcl::Boundary> est;
+        pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>());
+        pcl::PointCloud<pcl::Boundary>::Ptr boundaries(new pcl::PointCloud<pcl::Boundary>);
+
+        est.setInputCloud(cloud);
+        est.setInputNormals(normals);
+        est.setSearchMethod(tree);
+        est.setAngleThreshold(boundary_angle_threshold_);
+        est.compute(*boundaries);
+
+        return boundaries;
+    }
+
+    pcl::PointIndices::Ptr extractBoundaryPoints(pcl::PointCloud<pcl::Boundary>::Ptr boundaries) {
+        pcl::PointIndices::Ptr boundary_indices(new pcl::PointIndices);
+        for (size_t i = 0; i < boundaries->size(); ++i) {
+            if ((*boundaries)[i].boundary_point > 0) {
+                boundary_indices->indices.push_back(i);
+            }
+        }
+        return boundary_indices;
+    }
+
+    pcl::PointIndices::Ptr optimizeSegmentation(
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud,
+        pcl::PointIndices::Ptr initial_planes,
+        pcl::PointIndices::Ptr boundary_indices) {
+
+        // 提取非平面点
+        pcl::PointIndices::Ptr uncoarse_indices(new pcl::PointIndices);
+        for (size_t i = 0; i < cloud->size(); ++i) {
+            if (std::find(initial_planes->indices.begin(),
+                initial_planes->indices.end(), i) == initial_planes->indices.end()) {
+                uncoarse_indices->indices.push_back(i);
+            }
+        }
+
+        // 构建边界点KD树
+        pcl::KdTreeFLANN<pcl::PointXYZ> kdtree;
+        pcl::PointCloud<pcl::PointXYZ>::Ptr boundary_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+        pcl::copyPointCloud(*cloud, boundary_indices->indices, *boundary_cloud);
+        kdtree.setInputCloud(boundary_cloud);
+
+        // 寻找共面点
+        pcl::PointIndices::Ptr coplanar_points(new pcl::PointIndices);
+        std::vector<int> pointIdxNKNSearch(1);
+        std::vector<float> pointNKNSquaredDistance(1);
+
+        for (const auto& idx : uncoarse_indices->indices) {
+            if (kdtree.nearestKSearch(cloud->points[idx], 1, pointIdxNKNSearch, pointNKNSquaredDistance) > 0) {
+                float distance = std::sqrt(pointNKNSquaredDistance[0]);
+                if (distance < distance_threshold_) {
+                    coplanar_points->indices.push_back(idx);
+                }
+            }
+        }
+
+        // 合并初始平面点和共面点
+        pcl::PointIndices::Ptr final_planes(new pcl::PointIndices);
+        final_planes->indices = initial_planes->indices;
+        final_planes->indices.insert(final_planes->indices.end(),
+            coplanar_points->indices.begin(),
+            coplanar_points->indices.end());
+
+        return final_planes;
+    }
+
+    void separatePlanesAndCracks(
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud,
+        pcl::PointIndices::Ptr plane_indices,
+        pcl::PointCloud<pcl::PointXYZ>::Ptr plane_cloud,
+        pcl::PointCloud<pcl::PointXYZ>::Ptr crack_cloud) {
+
+        pcl::ExtractIndices<pcl::PointXYZ> extract;
+        extract.setInputCloud(cloud);
+        extract.setIndices(plane_indices);
+
+        // 提取平面点
+        extract.setNegative(false);
+        extract.filter(*plane_cloud);
+
+        // 提取裂缝点
+        extract.setNegative(true);
+        extract.filter(*crack_cloud);
+    }
+
+    // 参数
+    int k_search_;
+    float smooth_threshold_;         // 法线平滑阈值(度)
+    float curvature_threshold_;      // 曲率阈值
+    int min_cluster_size_;           // 最小聚类点数
+    float boundary_angle_threshold_; // 边界点角度阈值(弧度)
+    float distance_threshold_;       // 距离阈值(米)
+};
+
+int main(int argc, char** argv) {
+    // 加载点云数据
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
+    if (pcl::io::loadPCDFile<pcl::PointXYZ>("resource.pcd", *cloud) == -1) {
+        PCL_ERROR("点云文件加载失败\n");
+        return -1;
+    }
+
+    // 创建平面分割器
+    PlaneSegmenter segmenter;
+
+    // 设置参数（根据点云特性调整）
+    segmenter.setDistanceThreshold(0.003); // 3mm距离阈值
+
+    // 执行分割
+    pcl::PointCloud<pcl::PointXYZ>::Ptr plane_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+    pcl::PointCloud<pcl::PointXYZ>::Ptr crack_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+    segmenter.segment(cloud, plane_cloud, crack_cloud);
+
+    // 保存结果
+    pcl::io::savePCDFile("plane_points.pcd", *plane_cloud);
+    pcl::io::savePCDFile("crack_points.pcd", *crack_cloud);
+
+    // 可视化结果
+    pcl::visualization::PCLVisualizer viewer("Plane Segmentation Result");
+    viewer.setBackgroundColor(0, 0, 0);
+
+    // 添加原始点云（灰色）
+    pcl::visualization::PointCloudColorHandlerCustom<pcl::PointXYZ> cloud_color(cloud, 150, 150, 150);
+    viewer.addPointCloud<pcl::PointXYZ>(cloud, cloud_color, "original_cloud");
+
+    // 添加平面点云（蓝色）
+    pcl::visualization::PointCloudColorHandlerCustom<pcl::PointXYZ> plane_color(plane_cloud, 0, 0, 255);
+    viewer.addPointCloud<pcl::PointXYZ>(plane_cloud, plane_color, "plane_cloud");
+
+    // 添加裂缝点云（红色）
+    pcl::visualization::PointCloudColorHandlerCustom<pcl::PointXYZ> crack_color(crack_cloud, 255, 0, 0);
+    viewer.addPointCloud<pcl::PointXYZ>(crack_cloud, crack_color, "crack_cloud");
+
+    viewer.setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 2, "plane_cloud");
+    viewer.setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 3, "crack_cloud");
+
+    viewer.addCoordinateSystem(0.1);
+    viewer.initCameraParameters();
+
+    while (!viewer.wasStopped()) {
+        viewer.spinOnce(100);
+    }
+
+    return 0;
+}
