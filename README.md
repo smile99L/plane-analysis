@@ -106,6 +106,6 @@ The first step is to run a file called "plane segment" to generate planes and cr
 
 The second step is to run the "plane analysis" file on the premise that the file name corresponds.
 
-<img src="utils/media/teaser.png" alt="Network" style="zoom:50%;">
+<img src="demo.png" alt="Network" style="zoom:50%;">
 
 
